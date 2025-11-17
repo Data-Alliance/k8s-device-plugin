@@ -17,7 +17,11 @@
 package rm
 
 import (
+	"bufio"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/info"
@@ -107,46 +111,169 @@ func (b *deviceMapBuilder) buildDeviceMapFromConfigResources() (DeviceMap, error
 // buildGPUDeviceMap builds a map of resource names to GPU devices
 func (b *deviceMapBuilder) buildGPUDeviceMap() (DeviceMap, error) {
 	devices := make(DeviceMap)
+	var errors []error
+	successCount := 0
+
+	// Check if gpu-select file exists and read it
+	const gpuSelectPath = "/var/lib/kubelet/device-plugins/gpu-select"
+	selectedIndex, selectedUUID, gpuSelectErr := readGPUSelectFile(gpuSelectPath)
+
+	// Get device count by getting all devices
+	allDevices, devErr := b.GetDevices()
+	if devErr != nil {
+		klog.Warningf("Failed to get devices for counting: %v", devErr)
+	}
+	count := len(allDevices)
+
+	// Determine if we should filter devices
+	shouldFilter := gpuSelectErr == nil && count >= 2 && selectedIndex >= 0 && selectedUUID != ""
+	if shouldFilter {
+		klog.Infof("GPU filtering enabled: will only use GPU %d (UUID: %s)", selectedIndex, selectedUUID)
+	}
 
 	err := b.VisitDevices(func(i int, gpu device.Device) error {
+		// Apply GPU selection filter if enabled
+		if shouldFilter {
+			deviceIndex, ret := gpu.GetIndex()
+			if ret != nvml.SUCCESS {
+				klog.Warningf("Failed to get device index for GPU %d: %v", i, ret)
+				return nil // Continue with other GPUs
+			}
+
+			deviceUUID, ret := gpu.GetUUID()
+			if ret != nvml.SUCCESS {
+				klog.Warningf("Failed to get device UUID for GPU %d: %v", i, ret)
+				return nil // Continue with other GPUs
+			}
+
+			// Skip if this device doesn't match the selected index and UUID
+			if deviceIndex != selectedIndex || deviceUUID != selectedUUID {
+				klog.Infof("Skipping GPU %d (UUID: %s) - not matching selected GPU (index: %d, UUID: %s)",
+					deviceIndex, deviceUUID, selectedIndex, selectedUUID)
+				return nil // Continue with other GPUs
+			}
+
+			klog.Infof("GPU %d (UUID: %s) matches gpu-select file", deviceIndex, deviceUUID)
+		}
+
 		name, ret := gpu.GetName()
 		if ret != nvml.SUCCESS {
-			return fmt.Errorf("error getting product name for GPU: %v", ret)
+			err := fmt.Errorf("error getting product name for GPU %d: %v", i, ret)
+			errors = append(errors, err)
+			klog.Warningf("Skipping GPU %d due to error: %v", i, err)
+			return nil // Continue with other GPUs
 		}
 		migEnabled, err := gpu.IsMigEnabled()
 		if err != nil {
-			return fmt.Errorf("error checking if MIG is enabled on GPU: %v", err)
+			err := fmt.Errorf("error checking if MIG is enabled on GPU %d: %v", i, err)
+			errors = append(errors, err)
+			klog.Warningf("Skipping GPU %d due to MIG check error: %v", i, err)
+			return nil // Continue with other GPUs
 		}
 		if migEnabled && *b.migStrategy != spec.MigStrategyNone {
 			return nil
 		}
+
+		matched := false
 		for _, resource := range b.resources.GPUs {
 			if resource.Pattern.Matches(name) {
 				index, info := b.newGPUDevice(i, gpu)
-				return devices.setEntry(resource.Name, index, info)
+				if err := devices.setEntry(resource.Name, index, info); err != nil {
+					err := fmt.Errorf("error setting device entry for GPU %d: %v", i, err)
+					errors = append(errors, err)
+					klog.Warningf("Skipping GPU %d due to device entry error: %v", i, err)
+					return nil // Continue with other GPUs
+				}
+				matched = true
+				successCount++
+				klog.Infof("Successfully added GPU %d (%s) to resource %s", i, name, resource.Name)
+				break
 			}
 		}
-		return fmt.Errorf("GPU name '%v' does not match any resource patterns", name)
+
+		if !matched {
+			err := fmt.Errorf("GPU %d name '%v' does not match any resource patterns", i, name)
+			errors = append(errors, err)
+			klog.Warningf("Skipping GPU %d: %v", i, err)
+		}
+
+		return nil // Always continue with other GPUs
 	})
+
+	// Log summary of GPU processing
+	if len(errors) > 0 {
+		klog.Warningf("Encountered %d errors while processing GPUs, but %d GPUs were successfully added", len(errors), successCount)
+		for _, err := range errors {
+			klog.Warningf("GPU processing error: %v", err)
+		}
+	}
+
+	if successCount > 0 {
+		klog.Infof("Successfully processed %d GPUs", successCount)
+		return devices, err // Return the original VisitDevices error if any
+	}
+
+	// If no GPUs were successfully processed, return an error
+	if len(errors) > 0 {
+		return devices, fmt.Errorf("failed to process any GPUs: %d errors encountered", len(errors))
+	}
+
 	return devices, err
 }
 
 // buildMigDeviceMap builds a map of resource names to MIG devices
 func (b *deviceMapBuilder) buildMigDeviceMap() (DeviceMap, error) {
 	devices := make(DeviceMap)
+	var errors []error
+	successCount := 0
+
 	err := b.VisitMigDevices(func(i int, d device.Device, j int, mig device.MigDevice) error {
 		migProfile, err := mig.GetProfile()
 		if err != nil {
-			return fmt.Errorf("error getting MIG profile for MIG device at index '(%v, %v)': %v", i, j, err)
+			err := fmt.Errorf("error getting MIG profile for MIG device at index '(%v, %v)': %v", i, j, err)
+			errors = append(errors, err)
+			klog.Warningf("Skipping MIG device (%d, %d) due to profile error: %v", i, j, err)
+			return nil // Continue with other MIG devices
 		}
+
+		matched := false
 		for _, resource := range b.resources.MIGs {
 			if resource.Pattern.Matches(migProfile.String()) {
 				index, info := newMigDevice(i, j, mig)
-				return devices.setEntry(resource.Name, index, info)
+				if err := devices.setEntry(resource.Name, index, info); err != nil {
+					err := fmt.Errorf("error setting device entry for MIG device (%d, %d): %v", i, j, err)
+					errors = append(errors, err)
+					klog.Warningf("Skipping MIG device (%d, %d) due to device entry error: %v", i, j, err)
+					return nil // Continue with other MIG devices
+				}
+				matched = true
+				successCount++
+				klog.Infof("Successfully added MIG device (%d, %d) with profile %s to resource %s", i, j, migProfile.String(), resource.Name)
+				break
 			}
 		}
-		return fmt.Errorf("MIG profile '%v' does not match any resource patterns", migProfile)
+
+		if !matched {
+			err := fmt.Errorf("MIG device (%d, %d) profile '%v' does not match any resource patterns", i, j, migProfile)
+			errors = append(errors, err)
+			klog.Warningf("Skipping MIG device (%d, %d): %v", i, j, err)
+		}
+
+		return nil // Always continue with other MIG devices
 	})
+
+	// Log summary of MIG device processing
+	if len(errors) > 0 {
+		klog.Warningf("Encountered %d errors while processing MIG devices, but %d MIG devices were successfully added", len(errors), successCount)
+		for _, err := range errors {
+			klog.Warningf("MIG device processing error: %v", err)
+		}
+	}
+
+	if successCount > 0 {
+		klog.Infof("Successfully processed %d MIG devices", successCount)
+	}
+
 	return devices, err
 }
 
@@ -333,4 +460,46 @@ func updateDeviceMapWithReplicas(replicatedResources *spec.ReplicatedResources, 
 	}
 
 	return devices, nil
+}
+
+// readGPUSelectFile reads the gpu-select file and returns the index and UUID
+// The file format is "index uuid" (e.g., "0 GPU-12345678-1234-1234-1234-123456789012")
+// Returns -1, empty string and error if file doesn't exist or is invalid
+func readGPUSelectFile(path string) (int, string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.Infof("GPU select file %s does not exist, using all GPUs", path)
+			return -1, "", err
+		}
+		klog.Warningf("Failed to open GPU select file %s: %v", path, err)
+		return -1, "", err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		err := fmt.Errorf("GPU select file %s is empty", path)
+		klog.Warningf("%v", err)
+		return -1, "", err
+	}
+
+	line := strings.TrimSpace(scanner.Text())
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		err := fmt.Errorf("invalid format in GPU select file %s: expected 'index uuid', got '%s'", path, line)
+		klog.Warningf("%v", err)
+		return -1, "", err
+	}
+
+	index, err := strconv.Atoi(parts[0])
+	if err != nil {
+		err := fmt.Errorf("invalid index in GPU select file %s: %v", path, err)
+		klog.Warningf("%v", err)
+		return -1, "", err
+	}
+
+	uuid := parts[1]
+	klog.Infof("Read GPU select file: index=%d, uuid=%s", index, uuid)
+	return index, uuid, nil
 }

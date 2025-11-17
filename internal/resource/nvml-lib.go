@@ -17,8 +17,15 @@
 package resource
 
 import (
+	"bufio"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	"k8s.io/klog/v2"
 )
 
 type nvmlLib struct {
@@ -54,8 +61,44 @@ func (l nvmlLib) GetDevices() ([]Device, error) {
 		return nil, err
 	}
 
+	// Check if gpu-select file exists and filter devices if needed
+	const gpuSelectPath = "/var/lib/kubelet/device-plugins/gpu-select"
+	selectedIndex, selectedUUID, err := readGPUSelectFile(gpuSelectPath)
+
+	// Get device count
+	count, ret := l.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		klog.Warningf("Failed to get device count: %v", ret)
+	}
+
 	var devices []Device
 	for _, d := range libdevices {
+		// If gpu-select file exists, device count >= 2, filter devices
+		if err == nil && count >= 2 && selectedIndex >= 0 && selectedUUID != "" {
+			// Get device index
+			deviceIndex, ret := d.GetIndex()
+			if ret != nvml.SUCCESS {
+				klog.Warningf("Failed to get device index: %v", ret)
+				continue
+			}
+
+			// Get device UUID
+			deviceUUID, ret := d.GetUUID()
+			if ret != nvml.SUCCESS {
+				klog.Warningf("Failed to get device UUID: %v", ret)
+				continue
+			}
+
+			// Check if this device matches the selected index and UUID
+			if deviceIndex != selectedIndex || deviceUUID != selectedUUID {
+				klog.Infof("Skipping GPU device %d (UUID: %s) - not matching selected GPU (index: %d, UUID: %s)",
+					deviceIndex, deviceUUID, selectedIndex, selectedUUID)
+				continue
+			}
+
+			klog.Infof("Selected GPU device %d (UUID: %s) matches gpu-select file", deviceIndex, deviceUUID)
+		}
+
 		device := nvmlDevice{
 			Device:    d,
 			devicelib: l.devicelib,
@@ -64,6 +107,48 @@ func (l nvmlLib) GetDevices() ([]Device, error) {
 	}
 
 	return devices, nil
+}
+
+// readGPUSelectFile reads the gpu-select file and returns the index and UUID
+// The file format is "index uuid" (e.g., "0 GPU-12345678-1234-1234-1234-123456789012")
+// Returns -1, empty string and error if file doesn't exist or is invalid
+func readGPUSelectFile(path string) (int, string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			klog.Infof("GPU select file %s does not exist, using all GPUs", path)
+			return -1, "", err
+		}
+		klog.Warningf("Failed to open GPU select file %s: %v", path, err)
+		return -1, "", err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		err := fmt.Errorf("GPU select file %s is empty", path)
+		klog.Warningf("%v", err)
+		return -1, "", err
+	}
+
+	line := strings.TrimSpace(scanner.Text())
+	parts := strings.Fields(line)
+	if len(parts) != 2 {
+		err := fmt.Errorf("invalid format in GPU select file %s: expected 'index uuid', got '%s'", path, line)
+		klog.Warningf("%v", err)
+		return -1, "", err
+	}
+
+	index, err := strconv.Atoi(parts[0])
+	if err != nil {
+		err := fmt.Errorf("invalid index in GPU select file %s: %v", path, err)
+		klog.Warningf("%v", err)
+		return -1, "", err
+	}
+
+	uuid := parts[1]
+	klog.Infof("Read GPU select file: index=%d, uuid=%s", index, uuid)
+	return index, uuid, nil
 }
 
 // GetDriverVersion returns the driver version

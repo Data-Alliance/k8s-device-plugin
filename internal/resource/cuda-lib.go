@@ -19,6 +19,8 @@ package resource
 import (
 	"fmt"
 
+	"k8s.io/klog/v2"
+
 	"github.com/NVIDIA/k8s-device-plugin/internal/cuda"
 )
 
@@ -39,12 +41,32 @@ func (l *cudaLib) GetDevices() ([]Device, error) {
 	}
 
 	var devices []Device
+	var errors []error
 	for i := 0; i < count; i++ {
 		d, r := cuda.DeviceGet(i)
 		if r != cuda.SUCCESS {
-			return nil, fmt.Errorf("failed to get CUDA device %v: %v", i, r)
+			// Log the error but continue with other devices
+			err := fmt.Errorf("failed to get CUDA device %v: %v", i, r)
+			errors = append(errors, err)
+			continue
 		}
 		devices = append(devices, NewCudaDevice(d))
+	}
+
+	// If no devices were successfully retrieved, return an error
+	if len(devices) == 0 {
+		if len(errors) > 0 {
+			return nil, fmt.Errorf("failed to get any CUDA devices: %v", errors)
+		}
+		return nil, fmt.Errorf("no CUDA devices found")
+	}
+
+	// If some devices failed but at least one succeeded, log warnings but return success
+	if len(errors) > 0 {
+		for _, err := range errors {
+			klog.Warningf("Failed to initialize some CUDA devices: %v", err)
+		}
+		klog.Infof("Successfully initialized %d out of %d CUDA devices", len(devices), count)
 	}
 
 	return devices, nil
