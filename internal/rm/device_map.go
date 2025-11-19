@@ -20,7 +20,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/NVIDIA/go-nvlib/pkg/nvlib/device"
@@ -116,7 +115,7 @@ func (b *deviceMapBuilder) buildGPUDeviceMap() (DeviceMap, error) {
 
 	// Check if gpu-select file exists and read it
 	const gpuSelectPath = "/var/lib/kubelet/device-plugins/gpu-select"
-	selectedIndex, selectedUUID, gpuSelectErr := readGPUSelectFile(gpuSelectPath)
+	selectedUUID, gpuSelectErr := readGPUSelectFile(gpuSelectPath)
 
 	// Get device count by getting all devices
 	allDevices, devErr := b.GetDevices()
@@ -125,35 +124,29 @@ func (b *deviceMapBuilder) buildGPUDeviceMap() (DeviceMap, error) {
 	}
 	count := len(allDevices)
 
-	// Determine if we should filter devices
-	shouldFilter := gpuSelectErr == nil && count >= 2 && selectedIndex >= 0 && selectedUUID != ""
+	// Determine if we should filter devices by UUID only
+	shouldFilter := gpuSelectErr == nil && count >= 2 && selectedUUID != ""
 	if shouldFilter {
-		klog.Infof("GPU filtering enabled: will only use GPU %d (UUID: %s)", selectedIndex, selectedUUID)
+		klog.Infof("GPU filtering enabled: will only use GPU (UUID: %s)", selectedUUID)
 	}
 
 	err := b.VisitDevices(func(i int, gpu device.Device) error {
 		// Apply GPU selection filter if enabled
 		if shouldFilter {
-			deviceIndex, ret := gpu.GetIndex()
-			if ret != nvml.SUCCESS {
-				klog.Warningf("Failed to get device index for GPU %d: %v", i, ret)
-				return nil // Continue with other GPUs
-			}
-
 			deviceUUID, ret := gpu.GetUUID()
 			if ret != nvml.SUCCESS {
 				klog.Warningf("Failed to get device UUID for GPU %d: %v", i, ret)
 				return nil // Continue with other GPUs
 			}
 
-			// Skip if this device doesn't match the selected index and UUID
-			if deviceIndex != selectedIndex || deviceUUID != selectedUUID {
-				klog.Infof("Skipping GPU %d (UUID: %s) - not matching selected GPU (index: %d, UUID: %s)",
-					deviceIndex, deviceUUID, selectedIndex, selectedUUID)
+			// Skip if this device doesn't match the selected UUID
+			if deviceUUID != selectedUUID {
+				klog.Infof("Skipping GPU %d (UUID: %s) - not matching selected GPU (UUID: %s)",
+					i, deviceUUID, selectedUUID)
 				return nil // Continue with other GPUs
 			}
 
-			klog.Infof("GPU %d (UUID: %s) matches gpu-select file", deviceIndex, deviceUUID)
+			klog.Infof("GPU %d (UUID: %s) matches gpu-select file", i, deviceUUID)
 		}
 
 		name, ret := gpu.GetName()
@@ -462,18 +455,18 @@ func updateDeviceMapWithReplicas(replicatedResources *spec.ReplicatedResources, 
 	return devices, nil
 }
 
-// readGPUSelectFile reads the gpu-select file and returns the index and UUID
-// The file format is "index uuid" (e.g., "0 GPU-12345678-1234-1234-1234-123456789012")
-// Returns -1, empty string and error if file doesn't exist or is invalid
-func readGPUSelectFile(path string) (int, string, error) {
+// readGPUSelectFile reads the gpu-select file and returns the UUID
+// The file format is just "uuid" (e.g., "GPU-12345678-1234-1234-1234-123456789012")
+// Returns empty string and error if file doesn't exist or is invalid
+func readGPUSelectFile(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			klog.Infof("GPU select file %s does not exist, using all GPUs", path)
-			return -1, "", err
+			return "", err
 		}
 		klog.Warningf("Failed to open GPU select file %s: %v", path, err)
-		return -1, "", err
+		return "", err
 	}
 	defer file.Close()
 
@@ -481,25 +474,17 @@ func readGPUSelectFile(path string) (int, string, error) {
 	if !scanner.Scan() {
 		err := fmt.Errorf("GPU select file %s is empty", path)
 		klog.Warningf("%v", err)
-		return -1, "", err
+		return "", err
 	}
 
 	line := strings.TrimSpace(scanner.Text())
-	parts := strings.Fields(line)
-	if len(parts) != 2 {
-		err := fmt.Errorf("invalid format in GPU select file %s: expected 'index uuid', got '%s'", path, line)
+	if line == "" {
+		err := fmt.Errorf("GPU select file %s contains only whitespace", path)
 		klog.Warningf("%v", err)
-		return -1, "", err
+		return "", err
 	}
 
-	index, err := strconv.Atoi(parts[0])
-	if err != nil {
-		err := fmt.Errorf("invalid index in GPU select file %s: %v", path, err)
-		klog.Warningf("%v", err)
-		return -1, "", err
-	}
-
-	uuid := parts[1]
-	klog.Infof("Read GPU select file: index=%d, uuid=%s", index, uuid)
-	return index, uuid, nil
+	uuid := line
+	klog.Infof("Read GPU select file: uuid=%s", uuid)
+	return uuid, nil
 }
